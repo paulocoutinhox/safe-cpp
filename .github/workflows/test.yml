@@ -1,0 +1,200 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test ${{ matrix.config.os }} ${{ matrix.config.cxx }} C++${{ matrix.standard }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        standard: [20, 23]
+        config:
+          - os: ubuntu-latest
+            cxx: g++
+            sanitizers: ON
+          - os: ubuntu-latest
+            cxx: clang++
+            sanitizers: ON
+          - os: macos-latest
+            cxx: clang++
+            sanitizers: ON
+          - os: windows-latest
+            cxx: cl
+            sanitizers: OFF
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select compiler
+        if: runner.os != 'Windows'
+        run: echo "CXX=${{ matrix.config.cxx }}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_STANDARD=${{ matrix.standard }}
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON
+          -DSAFE_CPP_BUILD_TESTS=ON
+          -DSAFE_CPP_BUILD_EXAMPLES=ON
+          -DSAFE_CPP_ENABLE_SANITIZERS=${{ matrix.config.sanitizers }}
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: halt_on_error=1:abort_on_error=1:detect_leaks=${{ runner.os == 'Linux' && '1' || '0' }}
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build -C Debug --output-on-failure
+
+  tsan:
+    name: tsan ubuntu ${{ matrix.cxx }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select compiler
+        run: echo "CXX=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_STANDARD=20
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON
+          -DSAFE_CPP_BUILD_TESTS=ON
+          -DSAFE_CPP_ENABLE_THREAD_SANITIZER=ON
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+
+      - name: Test
+        env:
+          TSAN_OPTIONS: halt_on_error=1:abort_on_error=1
+        run: ctest --test-dir build -C Debug --output-on-failure
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install lcov
+        run: sudo apt-get update && sudo apt-get install -y lcov
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_STANDARD=20
+          -DCMAKE_CXX_STANDARD_REQUIRED=ON
+          -DSAFE_CPP_BUILD_TESTS=ON
+          -DSAFE_CPP_ENABLE_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Capture coverage
+        run: |
+          lcov --capture --directory build --output-file coverage.info \
+            --ignore-errors mismatch,inconsistent,gcov,empty,negative,unused \
+            --rc branch_coverage=0
+          lcov --extract coverage.info \
+            "${GITHUB_WORKSPACE}/include/*" \
+            "${GITHUB_WORKSPACE}/src/*" \
+            --output-file coverage.info \
+            --ignore-errors unused,empty
+          lcov --list coverage.info --ignore-errors unused,empty | tee coverage.txt
+          {
+            echo "## Coverage"
+            echo
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.info
+
+      - uses: codecov/codecov-action@v5
+        with:
+          files: coverage.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check format
+        run: python3 make.py format-check
+
+  package:
+    name: package ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DSAFE_CPP_BUILD_TESTS=OFF
+          -DSAFE_CPP_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Install
+        run: cmake --install build --config Release --prefix "${{ github.workspace }}/install"
+
+      - name: Consume installed package
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir consume
+          cat > consume/CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(safe-cpp-consume LANGUAGES CXX)
+          find_package(safe-cpp CONFIG REQUIRED)
+          add_executable(consume main.cpp)
+          target_link_libraries(consume PRIVATE safe-cpp::safe-cpp)
+          EOF
+          cat > consume/main.cpp << 'EOF'
+          #include <safe_cpp/version/version.hpp>
+          int main()
+          {
+              return safe::version::languageLevel() >= 20 ? 0 : 1;
+          }
+          EOF
+          cmake -S consume -B consume/build -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install" -DCMAKE_BUILD_TYPE=Release
+          cmake --build consume/build --config Release --parallel
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            consume/build/Release/consume.exe
+          else
+            consume/build/consume
+          fi
